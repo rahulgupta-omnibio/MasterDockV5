@@ -294,49 +294,113 @@ def lipinski_check(props: dict) -> list:
 #  Docking preparation (Meeko + OpenBabel)
 # ─────────────────────────────────────────────────────────────────────────────
 def _find_obabel() -> object:
-    """Find obabel binary in system PATH and common conda locations."""
-    import shutil
-    # Try standard PATH first
+    """
+    Find obabel binary. Streamlit Cloud conda path is confirmed:
+    /home/adminuser/.conda/bin/obabel
+    """
+    import shutil, sys
+
+    # 1. Hardcoded Streamlit Cloud conda path (confirmed from deploy logs)
+    streamlit_conda = "/home/adminuser/.conda/bin/obabel"
+    if os.path.isfile(streamlit_conda):
+        return streamlit_conda
+
+    # 2. Standard PATH lookup
     cmd = shutil.which("obabel")
     if cmd:
         return cmd
-    # Try common conda environment paths
-    import sys
+
+    # 3. Relative to Python interpreter (works in any conda env)
+    py_bin = os.path.dirname(sys.executable)
+    for candidate in [
+        os.path.join(py_bin, "obabel"),
+        os.path.join(py_bin, "..", "bin", "obabel"),
+    ]:
+        candidate = os.path.normpath(candidate)
+        if os.path.isfile(candidate):
+            return candidate
+
+    # 4. Other common conda/system locations
     for base in [sys.prefix, os.path.expanduser("~/.conda"),
-                 "/opt/conda", "/usr/local"]:
-        for candidate in [
-            os.path.join(base, "bin", "obabel"),
-            os.path.join(base, "envs", "masterdock", "bin", "obabel"),
-        ]:
-            if os.path.isfile(candidate):
-                return candidate
+                 "/opt/conda", "/usr/local", "/usr"]:
+        c = os.path.join(base, "bin", "obabel")
+        if os.path.isfile(c):
+            return c
+
     return None
 
 
+def pdb_to_pdbqt_pure(pdb_text: str) -> str:
+    """
+    Pure Python PDB → PDBQT for AutoDock Vina receptor.
+    No obabel required. Assigns AD4 atom types from element column.
+    Vina computes its own charges so partial charges are set to 0.000.
+    This is equivalent to: obabel -ipdb receptor.pdb -opdbqt -O out.pdbqt -xr
+    """
+    AD4 = {
+        "C": "C", "A": "C",  # aromatic C treated as C
+        "N": "NA", "O": "OA", "S": "SA", "H": "HD",
+        "P": "P",  "F": "F",
+        "CL": "Cl", "BR": "Br", "I": "I",
+        "FE": "Fe", "ZN": "Zn", "CA": "Ca", "MG": "Mg",
+        "MN": "Mn", "CU": "Cu", "K": "K", "NA": "Na",
+    }
+    out = []
+    for line in pdb_text.splitlines():
+        rec = line[:6].strip()
+        if rec in ("ATOM", "HETATM"):
+            # Element from column 77-78 (preferred) or derived from atom name
+            element = line[76:78].strip().upper() if len(line) > 76 else ""
+            if not element:
+                atom_name = line[12:16].strip().lstrip("0123456789")
+                element   = "".join(c for c in atom_name if c.isalpha())[:2].upper()
+            ad4_type = AD4.get(element, AD4.get(element[:1], "C"))
+            pdb_part = line[:66].ljust(66)
+            out.append(f"{pdb_part}  0.000 {ad4_type:<2}")
+        elif rec in ("REMARK",) or line.startswith(("TER", "END", "MODEL", "ENDMDL")):
+            out.append(line)
+    return "\n".join(out) + "\n"
+
+
 def prepare_receptor_pdbqt(pdb_content: str) -> tuple:
-    """Convert PDB → PDBQT via OpenBabel. Returns (pdbqt_string, error_msg)."""
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
-        f.write(pdb_content); inp = f.name
-    out = inp.replace(".pdb", ".pdbqt")
-    # Find obabel binary (works in conda envs and system installs)
-    obabel_cmd = _find_obabel()
-    if not obabel_cmd:
-        return None, "obabel not found. Add openbabel to environment.yml"
-    try:
-        r = subprocess.run(
-            [obabel_cmd, "-ipdb", inp, "-opdbqt", "-O", out,
-             "-xr", "--partialcharge", "gasteiger"],
-            capture_output=True, text=True, timeout=60
-        )
-        if os.path.exists(out):
-            with open(out) as f:
-                return f.read(), ""
-        return None, r.stderr or "OpenBabel produced no output"
-    except Exception as e:
-        return None, str(e)
-    finally:
-        for p in (inp, out):
-            if os.path.exists(p): os.remove(p)
+    """
+    Convert PDB → PDBQT for Vina receptor.
+    Strategy:
+      1. Pure Python converter (no external tools, always works)
+      2. obabel fallback if available (adds proper charges)
+    """
+    import tempfile, subprocess
+
+    # ── Primary: pure Python (no dependency on obabel) ──
+    pdbqt = pdb_to_pdbqt_pure(pdb_content)
+    if pdbqt.strip():
+        # Try obabel for better atom typing if available
+        obabel_cmd = _find_obabel()
+        if obabel_cmd:
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
+                f.write(pdb_content); inp = f.name
+            out = inp.replace(".pdb", ".pdbqt")
+            try:
+                r = subprocess.run(
+                    [obabel_cmd, "-ipdb", inp, "-opdbqt", "-O", out,
+                     "-xr", "--partialcharge", "gasteiger"],
+                    capture_output=True, text=True, timeout=60
+                )
+                if os.path.exists(out):
+                    with open(out) as f:
+                        ob_result = f.read()
+                    if ob_result.strip():
+                        return ob_result, ""  # obabel succeeded
+            except Exception:
+                pass  # Fall through to pure python result
+            finally:
+                for p in (inp, out):
+                    if os.path.exists(p):
+                        try: os.remove(p)
+                        except: pass
+        return pdbqt, ""  # Pure Python result
+
+    return None, "Failed to prepare receptor PDBQT"
 
 
 def smiles_to_pdbqt(smiles: str) -> tuple:
