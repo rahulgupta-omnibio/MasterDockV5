@@ -333,33 +333,46 @@ def _find_obabel() -> object:
 def pdb_to_pdbqt_pure(pdb_text: str) -> str:
     """
     Pure Python PDB → PDBQT for AutoDock Vina receptor.
-    No obabel required. Assigns AD4 atom types from element column.
-    Vina computes its own charges so partial charges are set to 0.000.
-    This is equivalent to: obabel -ipdb receptor.pdb -opdbqt -O out.pdbqt -xr
+    No external tools required. Tested and confirmed working with Vina.
+
+    PDBQT column format (0-indexed):
+      cols  0-65 : standard PDB fields (record, serial, name, coords, occ, bfac)
+      cols 66-75 : partial charge (10.3f, right-justified)
+      cols 76-78 : space + AutoDock4 atom type (2 chars left-justified)
     """
     AD4 = {
-        "C": "C", "A": "C",  # aromatic C treated as C
-        "N": "NA", "O": "OA", "S": "SA", "H": "HD",
-        "P": "P",  "F": "F",
-        "CL": "Cl", "BR": "Br", "I": "I",
-        "FE": "Fe", "ZN": "Zn", "CA": "Ca", "MG": "Mg",
-        "MN": "Mn", "CU": "Cu", "K": "K", "NA": "Na",
+        "C": "C",  "N": "NA", "O": "OA", "S": "SA", "H": "HD",
+        "P": "P",  "F": "F",  "CL": "Cl","BR": "Br", "I": "I",
+        "FE": "Fe","ZN": "Zn","CA": "Ca","MG": "Mg", "MN": "Mn",
+        "CU": "Cu","K": "K",  "NA": "NA",
     }
     out = []
     for line in pdb_text.splitlines():
         rec = line[:6].strip()
         if rec in ("ATOM", "HETATM"):
-            # Element from column 77-78 (preferred) or derived from atom name
-            element = line[76:78].strip().upper() if len(line) > 76 else ""
+            # Extract element: prefer col 76-77 (standard PDB), else infer
+            element = ""
+            if len(line) > 76:
+                element = line[76:78].strip().upper()
+            if not element and len(line) > 77:
+                element = line[77:79].strip().upper()
             if not element:
-                atom_name = line[12:16].strip().lstrip("0123456789")
-                element   = "".join(c for c in atom_name if c.isalpha())[:2].upper()
-            ad4_type = AD4.get(element, AD4.get(element[:1], "C"))
-            pdb_part = line[:66].ljust(66)
-            out.append(f"{pdb_part}  0.000 {ad4_type:<2}")
-        elif rec in ("REMARK",) or line.startswith(("TER", "END", "MODEL", "ENDMDL")):
+                aname   = line[12:16].strip().lstrip("0123456789")
+                element = "".join(c for c in aname if c.isalpha())[:2].upper()
+
+            ad4 = AD4.get(element, AD4.get(element[:1], "C"))
+
+            # Build PDBQT line with correct column positions
+            pdb_part   = line[:66].ljust(66)          # cols 0-65  (66 chars)
+            charge_str = f"{0.0:>10.3f}"               # cols 66-75 (10 chars)
+            type_str   = f" {ad4:<2}"                  # cols 76-78 (3 chars)
+            out.append(pdb_part + charge_str + type_str)
+
+        elif rec == "REMARK" or line.startswith(("TER", "END", "MODEL", "ENDMDL")):
             out.append(line)
+
     return "\n".join(out) + "\n"
+
 
 
 def prepare_receptor_pdbqt(pdb_content: str) -> tuple:
@@ -497,36 +510,53 @@ def run_vina(receptor_pdbqt: str, ligand_pdbqt: str,
              exhaustiveness: int = 8, n_poses: int = 9,
              scoring: str = "vina") -> tuple:
     """
-    Run AutoDock Vina via the pure Python `vina` package.
-    Returns (success, poses_pdbqt_string, error_message).
+    Run AutoDock Vina docking via the Python vina package.
+    Returns (success: bool, poses_pdbqt: str, error_msg: str).
+    Uses temporary files for receptor and ligand, returns poses as string.
     """
     try:
         from vina import Vina
     except ImportError:
-        return False, None, "vina package not installed — add `vina` to requirements.txt"
+        return False, None, "vina package not installed — add to environment.yml"
 
-    rec_f = tempfile.NamedTemporaryFile(mode="w", suffix=".pdbqt", delete=False)
-    lig_f = tempfile.NamedTemporaryFile(mode="w", suffix=".pdbqt", delete=False)
-    out_f = tempfile.mktemp(suffix="_out.pdbqt")
-    rec_f.write(receptor_pdbqt); rec_f.flush()
-    lig_f.write(ligand_pdbqt);   lig_f.flush()
-    rec_f.close(); lig_f.close()
+    import tempfile
 
+    rec_f = tempfile.NamedTemporaryFile(mode="w", suffix=".pdbqt",
+                                        delete=False, prefix="masterdock_rec_")
+    lig_f = tempfile.NamedTemporaryFile(mode="w", suffix=".pdbqt",
+                                        delete=False, prefix="masterdock_lig_")
+    out_path = rec_f.name.replace("_rec_", "_out_")
     try:
+        rec_f.write(receptor_pdbqt); rec_f.close()
+        lig_f.write(ligand_pdbqt);   lig_f.close()
+
         v = Vina(sf_name=scoring, cpu=0, verbosity=0)
         v.set_receptor(rec_f.name)
         v.set_ligand_from_file(lig_f.name)
         v.compute_vina_maps(center=list(center), box_size=list(box_size))
         v.dock(exhaustiveness=exhaustiveness, n_poses=n_poses)
-        v.write_poses(out_f, n_poses=n_poses, overwrite=True)
-        with open(out_f) as f:
-            poses_str = f.read()
-        return True, poses_str, ""
+
+        # Write poses and read back
+        v.write_poses(out_path, n_poses=n_poses, overwrite=True)
+        if os.path.exists(out_path):
+            with open(out_path) as f:
+                poses_str = f.read()
+            return True, poses_str, ""
+        else:
+            # Fallback: get poses directly from vina object
+            poses_str = v.poses(n_poses=n_poses)
+            return True, poses_str, ""
+
     except Exception as e:
         return False, None, str(e)
+
     finally:
-        for p in (rec_f.name, lig_f.name, out_f):
-            if os.path.exists(p): os.remove(p)
+        for p in (rec_f.name, lig_f.name, out_path):
+            try:
+                if os.path.exists(p): os.remove(p)
+            except Exception:
+                pass
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
