@@ -1,0 +1,19 @@
+name: masterdock
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - vina
+  - openbabel
+  - rdkit
+  - biopython
+  - pandas
+  - numpy
+  - plotly
+  - scipy
+  - pip
+  - pip:
+    - streamlit>=1.32.0
+    - meeko
+    - gemmi
