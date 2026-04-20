@@ -293,22 +293,45 @@ def lipinski_check(props: dict) -> list:
 # ─────────────────────────────────────────────────────────────────────────────
 #  Docking preparation (Meeko + OpenBabel)
 # ─────────────────────────────────────────────────────────────────────────────
+def _find_obabel() -> object:
+    """Find obabel binary in system PATH and common conda locations."""
+    import shutil
+    # Try standard PATH first
+    cmd = shutil.which("obabel")
+    if cmd:
+        return cmd
+    # Try common conda environment paths
+    import sys
+    for base in [sys.prefix, os.path.expanduser("~/.conda"),
+                 "/opt/conda", "/usr/local"]:
+        for candidate in [
+            os.path.join(base, "bin", "obabel"),
+            os.path.join(base, "envs", "masterdock", "bin", "obabel"),
+        ]:
+            if os.path.isfile(candidate):
+                return candidate
+    return None
+
+
 def prepare_receptor_pdbqt(pdb_content: str) -> tuple:
     """Convert PDB → PDBQT via OpenBabel. Returns (pdbqt_string, error_msg)."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".pdb", delete=False) as f:
         f.write(pdb_content); inp = f.name
     out = inp.replace(".pdb", ".pdbqt")
+    # Find obabel binary (works in conda envs and system installs)
+    obabel_cmd = _find_obabel()
+    if not obabel_cmd:
+        return None, "obabel not found. Add openbabel to environment.yml"
     try:
         r = subprocess.run(
-            ["obabel", "-ipdb", inp, "-opdbqt", "-O", out, "-xr", "--partialcharge", "gasteiger"],
+            [obabel_cmd, "-ipdb", inp, "-opdbqt", "-O", out,
+             "-xr", "--partialcharge", "gasteiger"],
             capture_output=True, text=True, timeout=60
         )
         if os.path.exists(out):
             with open(out) as f:
                 return f.read(), ""
         return None, r.stderr or "OpenBabel produced no output"
-    except FileNotFoundError:
-        return None, "openbabel not found — add to packages.txt"
     except Exception as e:
         return None, str(e)
     finally:
@@ -342,8 +365,9 @@ def smiles_to_pdbqt_obabel(smiles: str) -> tuple:
         f.write(smiles); inp = f.name
     out = inp.replace(".smi", ".pdbqt")
     try:
+        obabel_cmd = _find_obabel() or "obabel"
         r = subprocess.run(
-            ["obabel", "-ismi", inp, "-opdbqt", "-O", out,
+            [obabel_cmd, "-ismi", inp, "-opdbqt", "-O", out,
              "--gen3d", "--partialcharge", "gasteiger"],
             capture_output=True, text=True, timeout=60
         )
@@ -382,8 +406,9 @@ def sdf_to_pdbqt(sdf_content: str) -> tuple:
             f.write(sdf_content); inp = f.name
         out = inp.replace(".sdf", ".pdbqt")
         try:
+            _oc = _find_obabel() or "obabel"
             r = subprocess.run(
-                ["obabel", "-isdf", inp, "-opdbqt", "-O", out,
+                [_oc, "-isdf", inp, "-opdbqt", "-O", out,
                  "--partialcharge", "gasteiger"],
                 capture_output=True, text=True, timeout=60
             )
@@ -533,14 +558,166 @@ def find_contacts(receptor_pdb: str, ligand_pdbqt: str,
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+#  2D Interaction image & bond profile (RDKit-based)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def classify_interaction(dist: float, donor: bool = False,
+                          acceptor: bool = False, aromatic: bool = False) -> str:
+    """Classify interaction type by distance and atom properties."""
+    if dist <= 2.5:
+        return "Covalent"
+    if dist <= 3.5 and (donor or acceptor):
+        return "H-Bond"
+    if dist <= 4.0 and aromatic:
+        return "π-Stacking"
+    if dist <= 4.0:
+        return "Electrostatic"
+    return "Hydrophobic"
+
+
+def build_interaction_profile(contacts_df) -> dict:
+    """Build interaction type counts from contacts dataframe."""
+    if contacts_df is None or contacts_df.empty:
+        return {}
+    counts = {"H-Bond": 0, "Hydrophobic": 0,
+              "π-Stacking": 0, "Electrostatic": 0, "Covalent": 0}
+    hbond_atoms  = {"N", "O", "F", "S"}
+    pi_residues  = {"PHE", "TYR", "TRP", "HIS"}
+    for _, row in contacts_df.iterrows():
+        d    = row["Min dist (Å)"]
+        atom = row.get("Nearest atom", "")
+        res  = row.get("Res name", "")
+        is_hbond  = any(c in atom.upper() for c in hbond_atoms)
+        is_pi     = res.upper() in pi_residues
+        itype = classify_interaction(d, is_hbond, is_hbond, is_pi)
+        counts[itype] = counts.get(itype, 0) + 1
+    return {k: v for k, v in counts.items() if v > 0}
+
+
+def interaction_2d_svg(ligand_mol, contacts_df, size=(420, 340)) -> str:
+    """
+    Generate a 2D depiction of the ligand annotated with 
+    binding interaction indicators using RDKit.
+    Returns SVG string.
+    """
+    if ligand_mol is None:
+        return ""
+    try:
+        from rdkit.Chem.Draw import rdMolDraw2D
+        from rdkit.Chem import AllChem
+        mol = Chem.RWMol(ligand_mol)
+        AllChem.Compute2DCoords(mol)
+
+        # Color atoms that participate in interactions
+        atom_colors  = {}
+        bond_colors  = {}
+        atom_radii   = {}
+        highlight_atoms = []
+        highlight_bonds = []
+
+        if contacts_df is not None and not contacts_df.empty:
+            hbond_atoms = {"N", "O", "F", "S"}
+            for i, atom in enumerate(mol.GetAtoms()):
+                sym = atom.GetSymbol()
+                if sym in hbond_atoms:
+                    highlight_atoms.append(i)
+                    atom_colors[i] = (0.2, 0.6, 1.0)  # blue = H-bond capable
+                    atom_radii[i]  = 0.4
+                elif sym == "C" and atom.GetIsAromatic():
+                    highlight_atoms.append(i)
+                    atom_colors[i] = (1.0, 0.6, 0.1)  # orange = aromatic
+                    atom_radii[i]  = 0.3
+
+        d = rdMolDraw2D.MolDraw2DSVG(size[0], size[1])
+        d.drawOptions().clearBackground = False
+        d.drawOptions().addStereoAnnotation = True
+        if highlight_atoms:
+            d.DrawMolecule(mol, highlightAtoms=highlight_atoms,
+                           highlightAtomColors=atom_colors,
+                           highlightBonds=highlight_bonds,
+                           highlightBondColors=bond_colors,
+                           highlightAtomRadii=atom_radii)
+        else:
+            d.DrawMolecule(mol)
+        d.FinishDrawing()
+        svg = d.GetDrawingText()
+        svg = svg.replace("fill:#FFFFFF", "fill:#0d1117")
+        svg = svg.replace("fill:white", "fill:#0d1117")
+        return svg
+    except Exception as e:
+        return ""
+
+
+def interaction_pie(profile: dict) -> go.Figure:
+    """Donut chart of interaction type distribution."""
+    if not profile:
+        return None
+    colors = {
+        "H-Bond":       "#58a6ff",
+        "Hydrophobic":  "#3fb950",
+        "π-Stacking":   "#bc8cff",
+        "Electrostatic":"#e3b341",
+        "Covalent":     "#f85149",
+    }
+    labels = list(profile.keys())
+    values = list(profile.values())
+    clrs   = [colors.get(l, "#8b949e") for l in labels]
+    fig = go.Figure(go.Pie(
+        labels=labels, values=values,
+        hole=0.55,
+        marker=dict(colors=clrs, line=dict(color="#0d1117", width=2)),
+        textfont=dict(color="#c9d1d9", size=12),
+        hovertemplate="%{label}: %{value} contacts<extra></extra>",
+    ))
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#0d1117",
+        font_color="#c9d1d9",
+        showlegend=True,
+        legend=dict(font=dict(color="#c9d1d9", size=11)),
+        height=280,
+        margin=dict(l=20, r=20, t=10, b=10),
+        annotations=[dict(text=f"<b>{sum(values)}</b><br>contacts",
+                          x=0.5, y=0.5, showarrow=False,
+                          font=dict(color="#c9d1d9", size=13))],
+    )
+    return fig
+
+
+def distance_histogram(contacts_df) -> go.Figure:
+    """Histogram of contact distances."""
+    if contacts_df is None or contacts_df.empty:
+        return None
+    dists = contacts_df["Min dist (Å)"].values
+    fig = go.Figure(go.Histogram(
+        x=dists, nbinsx=15,
+        marker=dict(color="#58a6ff", line=dict(color="#0d1117", width=1)),
+        hovertemplate="Distance: %{x:.2f} Å<br>Count: %{y}<extra></extra>",
+    ))
+    fig.add_vline(x=3.5, line_dash="dash", line_color="#3fb950",
+                  annotation_text="H-bond cutoff", annotation_font_color="#3fb950")
+    fig.add_vline(x=4.5, line_dash="dash", line_color="#e3b341",
+                  annotation_text="VdW cutoff", annotation_font_color="#e3b341")
+    fig.update_layout(
+        paper_bgcolor="#0d1117", plot_bgcolor="#161b22",
+        font_color="#c9d1d9",
+        xaxis=dict(title="Distance (Å)", gridcolor="#21262d", zerolinecolor="#21262d"),
+        yaxis=dict(title="Count",        gridcolor="#21262d", zerolinecolor="#21262d"),
+        height=240,
+        margin=dict(l=50, r=20, t=20, b=50),
+        showlegend=False,
+    )
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 #  Plotly charts
 # ─────────────────────────────────────────────────────────────────────────────
 DARK = dict(
     paper_bgcolor="#0d1117",
     plot_bgcolor="#161b22",
     font_color="#c9d1d9",
-    gridcolor="#21262d",
 )
+AXIS_STYLE = dict(gridcolor="#21262d", zerolinecolor="#21262d")
 
 
 def affinity_bar_chart(df: pd.DataFrame) -> go.Figure:
@@ -557,8 +734,8 @@ def affinity_bar_chart(df: pd.DataFrame) -> go.Figure:
         xaxis_title="Pose", yaxis_title="Affinity (kcal/mol)",
         showlegend=False, height=300,
         margin=dict(l=40, r=20, t=20, b=40),
-        xaxis=dict(gridcolor="#21262d"),
-        yaxis=dict(gridcolor="#21262d"),
+        xaxis=dict(**AXIS_STYLE),
+        yaxis=dict(**AXIS_STYLE),
     )
     return fig
 
@@ -586,8 +763,10 @@ def radar_chart(props: dict) -> go.Figure:
         polar=dict(
             bgcolor="#161b22",
             radialaxis=dict(visible=True, range=[0, 1.5],
-                           gridcolor="#30363d", tickfont_color="#8b949e"),
-            angularaxis=dict(gridcolor="#30363d", tickfont_color="#c9d1d9"),
+                           gridcolor="#30363d",
+                           tickfont=dict(color="#8b949e")),
+            angularaxis=dict(gridcolor="#30363d",
+                             tickfont=dict(color="#c9d1d9")),
         ),
         legend=dict(x=0.8, y=1.1, font_size=11),
         margin=dict(l=60, r=60, t=30, b=30),
@@ -612,8 +791,8 @@ def contacts_chart(contacts_df: pd.DataFrame) -> go.Figure:
         xaxis_title="Distance (Å)", yaxis_title="",
         showlegend=False,
         margin=dict(l=100, r=80, t=20, b=40),
-        xaxis=dict(gridcolor="#21262d"),
-        yaxis=dict(gridcolor="#21262d"),
+        xaxis=dict(**AXIS_STYLE),
+        yaxis=dict(**AXIS_STYLE),
     )
     return fig
 
@@ -631,8 +810,8 @@ def rmsd_plot(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         **DARK, xaxis_title="Pose", yaxis_title="RMSD (Å)",
         height=260, margin=dict(l=40, r=20, t=20, b=40),
-        xaxis=dict(gridcolor="#21262d"),
-        yaxis=dict(gridcolor="#21262d"),
+        xaxis=dict(**AXIS_STYLE),
+        yaxis=dict(**AXIS_STYLE),
         legend=dict(x=0.7, y=1.0),
     )
     return fig
@@ -816,7 +995,7 @@ with tab1:
                         "data": receptor_content, "fmt": "pdb",
                         "style": style_map[view_mode]
                     }], 420)
-                components.html(html, height=440)
+                st.iframe(html, height=440)
 
                 if auto_center:
                     cx2, cy2, cz2 = pdb_centroid(receptor_content)
@@ -1023,71 +1202,133 @@ with tab2:
 #  TAB 3 — Analysis
 # ═══════════════════════════════════════════════════════════════════════════
 with tab3:
-    if st.session_state.scores_df is not None and not st.session_state.scores_df.empty:
+    if st.session_state.poses_pdbqt and st.session_state.scores_df is not None:
         scores_df = st.session_state.scores_df
         poses     = split_pdbqt_poses(st.session_state.poses_pdbqt)
-        sel_idx   = st.session_state.selected_pose
+        sel_idx   = st.session_state.get("selected_pose", 0)
+        sel_pdbqt = poses[sel_idx] if sel_idx < len(poses) else poses[0]
+        rec_pdb   = st.session_state.rec_content or ""
 
-        col1, col2 = st.columns(2)
+        # ── Compute contacts once
+        with st.spinner("Computing binding contacts…"):
+            contacts_df = find_contacts(rec_pdb, sel_pdbqt, cutoff=cutoff_Å)
+        profile = build_interaction_profile(contacts_df)
 
-        with col1:
-            st.markdown('<div class="sec"><span class="icon">📈</span> Affinity by Pose</div>',
-                        unsafe_allow_html=True)
-            st.plotly_chart(affinity_bar_chart(scores_df),
-                            use_container_width=True)
-
-            st.markdown('<div class="sec"><span class="icon">📐</span> RMSD Comparison</div>',
-                        unsafe_allow_html=True)
+        # ── Row 1: Energy plots
+        st.markdown('<div class="sec"><span class="icon">📈</span> Energy Analysis</div>',
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            st.caption("Binding affinity per pose (green = best)")
+            st.plotly_chart(affinity_bar_chart(scores_df), use_container_width=True)
+        with c2:
+            st.caption("RMSD of docked poses vs best pose")
             st.plotly_chart(rmsd_plot(scores_df), use_container_width=True)
 
-        with col2:
-            st.markdown('<div class="sec"><span class="icon">🤝</span> Binding Contacts</div>',
-                        unsafe_allow_html=True)
-            rec_pdb   = st.session_state.rec_content or ""
-            sel_pdbqt = poses[sel_idx] if sel_idx < len(poses) else poses[0]
+        st.divider()
 
-            with st.spinner("Analysing contacts…"):
-                contacts_df = find_contacts(rec_pdb, sel_pdbqt, cutoff=cutoff_Å)
+        # ── Row 2: 2D interaction image + pie chart
+        st.markdown('<div class="sec"><span class="icon">🔗</span> 2D Interaction Profile</div>',
+                    unsafe_allow_html=True)
+        c1, c2, c3 = st.columns([2, 1.5, 1.5])
 
+        with c1:
+            st.caption("Ligand 2D structure — highlighted atoms participate in binding")
+            svg = interaction_2d_svg(ligand_mol, contacts_df)
+            if svg:
+                st.markdown(
+                    f'<div style="background:#0d1117;border:1px solid #30363d;'
+                    f'border-radius:8px;padding:10px;text-align:center">{svg}</div>',
+                    unsafe_allow_html=True)
+                st.markdown(
+                    '<div style="font-size:.75rem;color:#8b949e;text-align:center;margin-top:4px">'
+                    '🔵 H-bond donors/acceptors &nbsp;|&nbsp; 🟠 Aromatic atoms</div>',
+                    unsafe_allow_html=True)
+            else:
+                st.info("No ligand loaded for 2D view.")
+
+        with c2:
+            st.caption("Interaction type distribution")
+            pie = interaction_pie(profile)
+            if pie:
+                st.plotly_chart(pie, use_container_width=True)
+            else:
+                st.info("No contacts found.")
+
+        with c3:
+            st.caption("Contact distance histogram")
+            hist = distance_histogram(contacts_df)
+            if hist:
+                st.plotly_chart(hist, use_container_width=True)
+
+        st.divider()
+
+        # ── Row 3: Contact residues table + bar chart
+        st.markdown('<div class="sec"><span class="icon">🤝</span> Binding Residues</div>',
+                    unsafe_allow_html=True)
+        c1, c2 = st.columns([2, 3])
+
+        with c1:
             if not contacts_df.empty:
-                cfig = contacts_chart(contacts_df)
-                if cfig:
-                    st.plotly_chart(cfig, use_container_width=True)
-
-                st.markdown('<div class="sec"><span class="icon">📋</span> Contact Residues</div>',
-                            unsafe_allow_html=True)
+                # Interaction type column
+                contacts_df["Type"] = contacts_df.apply(
+                    lambda r: classify_interaction(
+                        r["Min dist (Å)"],
+                        any(c in r.get("Nearest atom","").upper()
+                            for c in ["N","O","F","S"]),
+                        any(c in r.get("Nearest atom","").upper()
+                            for c in ["N","O","F","S"]),
+                        r.get("Res name","") in ["PHE","TYR","TRP","HIS"],
+                    ), axis=1
+                )
                 st.dataframe(
-                    contacts_df[["Residue", "Res name", "Min dist (Å)", "Nearest atom"]],
-                    use_container_width=True, height=220,
+                    contacts_df[["Residue","Res name","Min dist (Å)","Nearest atom","Type"]],
+                    use_container_width=True, height=320,
                 )
                 st.download_button(
                     "⬇️ Download contacts (.csv)",
                     data=contacts_df.to_csv(index=False).encode(),
-                    file_name="contacts.csv", mime="text/csv",
+                    file_name="binding_contacts.csv", mime="text/csv",
                 )
             else:
                 st.markdown(
-                    f'<div class="warn-box">No contacts found within {cutoff_Å} Å. '
-                    f'Try increasing the contact cutoff in the sidebar.</div>',
+                    f'<div class="warn-box">No contacts within {cutoff_Å} Å. '
+                    f'Increase the cutoff in the sidebar.</div>',
                     unsafe_allow_html=True)
 
-        # ── All poses overlay viewer
+        with c2:
+            cfig = contacts_chart(contacts_df)
+            if cfig:
+                st.caption("Nearest contact distance per residue")
+                st.plotly_chart(cfig, use_container_width=True)
+
+        st.divider()
+
+        # ── Row 4: All poses 3D overlay
         st.markdown('<div class="sec"><span class="icon">🔬</span> All Poses Overlay</div>',
                     unsafe_allow_html=True)
-        palette = ["#3fb950", "#58a6ff", "#e3b341", "#f85149",
-                   "#bc8cff", "#ff9966", "#79c0ff", "#ffa198",
-                   "#56d364", "#d2a8ff"]
+        palette = ["#3fb950","#58a6ff","#e3b341","#f85149",
+                   "#bc8cff","#ff9966","#79c0ff","#ffa198",
+                   "#56d364","#d2a8ff"]
         mols_overlay = []
         if st.session_state.rec_content:
-            mols_overlay.append({
-                "data": st.session_state.rec_content, "fmt": "pdb", "style": "cartoon"
-            })
+            mols_overlay.append({"data": st.session_state.rec_content,
+                                  "fmt": "pdb", "style": "cartoon"})
         for i, p in enumerate(poses):
-            mols_overlay.append({
-                "data": pdbqt_to_pdb(p), "fmt": "pdb",
-                "style": "stick", "color": palette[i % len(palette)]
-            })
-        components.html(viewer_html(mols_overlay, 440), height=460)
+            mols_overlay.append({"data": pdbqt_to_pdb(p), "fmt": "pdb",
+                                  "style": "stick",
+                                  "color": palette[i % len(palette)]})
+        components.html(viewer_html(mols_overlay, 440), height=460, scrolling=False)
+
+        # Pose legend
+        legend_html = " &nbsp; ".join(
+            f'<span style="color:{palette[i % len(palette)]};font-weight:600">'
+            f'● Pose {i+1} ({scores_df.iloc[i]["Affinity (kcal/mol)"]:.2f})</span>'
+            for i in range(min(len(scores_df), len(poses)))
+        )
+        st.markdown(
+            f'<div style="font-size:.8rem;text-align:center;margin-top:6px">{legend_html}</div>',
+            unsafe_allow_html=True)
 
     else:
         st.markdown('<div class="info-box">Run a docking calculation first to see analysis.</div>',
